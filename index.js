@@ -1,3 +1,5 @@
+// === FILE: claim_fast_bot.js ===
+
 const StellarSdk = require('stellar-sdk');
 const ed25519 = require('ed25519-hd-key');
 const bip39 = require('bip39');
@@ -10,34 +12,28 @@ StellarSdk.Networks.PUBLIC;
 
 const CLAIM_MNEMONIC = process.env.CLAIM_MNEMONIC;
 const SPONSOR_MNEMONIC = process.env.SPONSOR_MNEMONIC;
-const TARGET_ADDRESS = process.env.TARGET_ADDRESS;
 
 (async () => {
   const claimKey = await getKeypairFromMnemonic(CLAIM_MNEMONIC);
   const sponsorKey = await getKeypairFromMnemonic(SPONSOR_MNEMONIC);
 
-  console.log(`🚀 Bot dimulai. Akun: ${claimKey.publicKey()}`);
+  console.log(`🚀 Fast Claim Bot dimulai. Akun: ${claimKey.publicKey()}`);
 
   while (true) {
     try {
       const balances = await getClaimableBalances(claimKey.publicKey());
+      const claimableNow = balances.filter(b => isClaimableNow(b.claimants, claimKey.publicKey()));
 
-      for (const balance of balances) {
-        if (!isClaimableNow(balance.claimants, claimKey.publicKey())) continue;
-
+      if (claimableNow.length > 0) {
+        const tx = await buildClaimBatchTx(claimableNow, claimKey, sponsorKey);
         try {
-          const txClaim = await buildClaimTx(balance.id, claimKey, sponsorKey);
-          await sendTransaction(txClaim);
-          console.log(`✅ Berhasil klaim ${balance.amount} PI`);
-
-          const txTransfer = await buildTransferTx(claimKey, sponsorKey, TARGET_ADDRESS);
-          await sendTransaction(txTransfer);
-          console.log(`📦 Transfer ${TARGET_ADDRESS} sukses`);
+          await sendTransaction(tx);
+          console.log(`✅ Klaim ${claimableNow.length} saldo sukses`);
         } catch (err) {
           if (err.response?.data?.extras?.result_codes?.operations?.includes("op_claimable_balance_claimant_invalid")) {
-            console.warn("⚠️ Gagal klaim: Sudah diklaim bot lain");
+            console.warn("⚠️ Beberapa saldo sudah diklaim bot lain");
           } else {
-            console.error("❌ Error klaim/transfer:", err.message);
+            console.error("❌ Gagal kirim transaksi klaim:", err.message);
           }
         }
       }
@@ -70,53 +66,29 @@ function isClaimableNow(claimants, address) {
   return !notBefore || now > parseInt(notBefore);
 }
 
-// 🧾 Build transaksi klaim
-async function buildClaimTx(balanceId, claimKey, sponsorKey) {
+// ⚡ Bangun transaksi klaim batch cepat (maks 25)
+async function buildClaimBatchTx(balances, claimKey, sponsorKey) {
   const account = await server.loadAccount(claimKey.publicKey());
   const fee = await server.fetchBaseFee();
 
-  const tx = new StellarSdk.TransactionBuilder(account, {
+  const txBuilder = new StellarSdk.TransactionBuilder(account, {
     fee,
     networkPassphrase: StellarSdk.Networks.PUBLIC,
     feeAccount: sponsorKey.publicKey()
-  })
-    .addOperation(StellarSdk.Operation.claimClaimableBalance({ balanceId }))
-    .setTimeout(60)
-    .build();
+  }).setTimeout(30);
 
+  const selected = balances.slice(0, 25);
+  for (const b of selected) {
+    txBuilder.addOperation(StellarSdk.Operation.claimClaimableBalance({ balanceId: b.id }));
+  }
+
+  const tx = txBuilder.build();
   tx.sign(claimKey);
   tx.sign(sponsorKey);
   return tx;
 }
 
-// 💸 Build transaksi transfer
-async function buildTransferTx(fromKey, sponsorKey, toAddress) {
-  const account = await server.loadAccount(fromKey.publicKey());
-  const fee = await server.fetchBaseFee();
-  const balance = account.balances.find(b => b.asset_type === 'native');
-  const available = parseFloat(balance?.balance || 0) - 0.01;
-
-  if (available <= 0) throw new Error("Saldo tidak cukup");
-
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee,
-    networkPassphrase: StellarSdk.Networks.PUBLIC,
-    feeAccount: sponsorKey.publicKey()
-  })
-    .addOperation(StellarSdk.Operation.payment({
-      destination: toAddress,
-      asset: StellarSdk.Asset.native(),
-      amount: available.toFixed(7)
-    }))
-    .setTimeout(60)
-    .build();
-
-  tx.sign(fromKey);
-  tx.sign(sponsorKey);
-  return tx;
-}
-
-// 🚀 Submit transaksi ke jaringan
+// 🚀 Submit transaksi
 async function sendTransaction(tx) {
   return await server.submitTransaction(tx);
 }
